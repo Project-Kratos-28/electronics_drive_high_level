@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+    <xacro:macro name="gazebo_wheel_friction" params="prefix">
+        <gazebo reference="${prefix}_wheel_link">
+            <mu1>0.3</mu1>   <!-- along fdir1 = axle = lateral -->
+            <mu2>1.0</mu2>   <!-- rolling direction -->
+            <fdir1>0 1 0</fdir1>
+        </gazebo>
+    </xacro:macro>
+
+    <xacro:gazebo_wheel_friction prefix="fl"/>
+    <xacro:gazebo_wheel_friction prefix="fr"/>
+    <xacro:gazebo_wheel_friction prefix="rl"/>
+    <xacro:gazebo_wheel_friction prefix="rr"/>
+
+    <gazebo>
+        <plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+            <parameters>$(find rover_description)/config/controllers.yaml</parameters>
+        </plugin>
+    </gazebo>
+
+</robot>

@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="kratos_rover">
+
+    <xacro:property name="chassis_len" value="0.9"/>      <!-- Update to match your physical chassis length -->
+    <xacro:property name="chassis_width" value="0.65"/>    <!-- Update to match your physical chassis width -->
+    <xacro:property name="chassis_height" value="0.2"/>
+    
+    <xacro:property name="wheel_radius" value="0.30"/> 
+    <xacro:property name="wheel_max_vel" value="${100.0 * 2.0 * pi / 60.0}"/>
+    <xacro:property name="wheel_width" value="0.08"/>
+    
+    <xacro:property name="wheel_x_offset" value="0.516"/>  <!-- L / 2 -->
+    <xacro:property name="wheel_y_offset" value="0.395"/>  <!-- W / 2 -->
+    <xacro:property name="steer_z_offset" value="-0.05"/> 
+    <xacro:property name="steer_limit" value="1.57"/>
+
+    <material name="gray"><color rgba="0.6 0.6 0.6 1.0"/></material>
+    <material name="black"><color rgba="0.1 0.1 0.1 1.0"/></material>
+    <material name="blue"><color rgba="0.0 0.3 0.8 1.0"/></material>
+
+    <xacro:include filename="inertial_macros.xacro"/>
+    <xacro:include filename="core_chassis.xacro"/>
+    <xacro:include filename="wheel_macro.xacro"/>
+    
+    <xacro:swerve_wheel prefix="fl" x_reflect="1" y_reflect="1"/>
+    <xacro:swerve_wheel prefix="fr" x_reflect="1" y_reflect="-1"/>
+    <xacro:swerve_wheel prefix="rl" x_reflect="-1" y_reflect="1"/>
+    <xacro:swerve_wheel prefix="rr" x_reflect="-1" y_reflect="-1"/>
+
+    <xacro:include filename="ros2_control.xacro"/>
+    <xacro:include filename="gazebo_plugins.xacro"/>
+
+</robot>

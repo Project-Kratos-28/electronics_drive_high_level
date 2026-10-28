@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+    <ros2_control name="GazeboSystem" type="system">
+        <hardware>
+            <plugin>gz_ros2_control/GazeboSimSystem</plugin>
+        </hardware>
+
+        <xacro:macro name="steer_interface" params="prefix">
+            <joint name="${prefix}_steer_joint">
+                <command_interface name="position">
+                    <param name="min">-1.5708</param>
+                    <param name="max">1.5708</param>
+                </command_interface>
+                <state_interface name="position"/>
+            </joint>
+        </xacro:macro>
+
+        <xacro:macro name="drive_interface" params="prefix">
+            <joint name="${prefix}_drive_joint">
+                <command_interface name="velocity"/>
+                <state_interface name="velocity"/>
+                <state_interface name="position"/>
+            </joint>
+        </xacro:macro>
+
+        <xacro:steer_interface prefix="fl"/>
+        <xacro:steer_interface prefix="fr"/>
+        <xacro:steer_interface prefix="rl"/>
+        <xacro:steer_interface prefix="rr"/>
+
+        <xacro:drive_interface prefix="fl"/>
+        <xacro:drive_interface prefix="fr"/>
+        <xacro:drive_interface prefix="rl"/>
+        <xacro:drive_interface prefix="rr"/>
+    </ros2_control>
+</robot>
