@@ -293,13 +293,22 @@ class DriveController(Node):
                         delta_angles_deg = [-d_in_deg, -d_out_deg, d_in_deg, d_out_deg]
                         v_wheels = [v_in, v_out, v_in, v_out]
 
-            # --- 2. DIFFERENTIAL (changed) ---
+            # --- 2. DIFFERENTIAL (sector based) ---
             elif mode == 'DIFFERENTIAL':
                 delta_angles_deg = [0.0, 0.0, 0.0, 0.0]
-                
-                linear_vel = fwd * speed_scale
-                angular_vel = steer_x * speed_scale
 
+                # Stick angle: 0 = straight forward, + = right, +-180 = straight back
+                theta_deg = math.degrees(math.atan2(steer_x, fwd))
+                speed = speed_scale   # speed comes only from the speed axis
+
+                if abs(theta_deg) <= 45.0:            # FRONT sector: straight forward
+                    linear_vel, angular_vel = speed, 0.0
+                elif abs(theta_deg) >= 135.0:         # BACK sector: straight backward
+                    linear_vel, angular_vel = -speed, 0.0
+                elif steer_x > 0:                     # RIGHT sector: spin right
+                    linear_vel, angular_vel = 0.0, speed
+                else:                                 # LEFT sector: spin left
+                    linear_vel, angular_vel = 0.0, -speed
 
                 v_left = linear_vel + angular_vel
                 v_right = linear_vel - angular_vel
