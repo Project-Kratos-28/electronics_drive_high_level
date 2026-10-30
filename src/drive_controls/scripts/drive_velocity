@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Int32MultiArray
+from sensor_msgs.msg import Joy
+import math
+
+
+class Drive(Node):
+    def __init__(self):
+        super().__init__('drive_node')
+
+        self.deadzone = 0.1  # for joystick floats
+        self.max_rpm = 100   # maximum wheel velocity in RPM
+
+        # Store joystick values
+        self.linear = 0.0
+        self.rotational = 0.0
+        self.speed = 0.0
+
+        # Subscriber
+        self.subscription = self.create_subscription(
+            Joy,
+            '/joy',
+            self.callback,
+            10
+        )
+
+        # Publisher (wheel velocities in RPM)
+        self.values = Int32MultiArray()
+        self.publisher = self.create_publisher(
+            Int32MultiArray,
+            '/rover',
+            10
+        )
+
+        # Timer
+        self.timer = self.create_timer(0.02, self.move)  # 50 Hz
+
+    def callback(self, msg):
+        self.linear = msg.axes[1]
+        self.rotational = msg.axes[0]
+        self.speed = msg.axes[2]  # assume trigger -1→1
+
+    def move(self):
+
+        x = self.rotational  # left/right of stick
+        y = self.linear      # forward/back of stick
+
+        # Scale trigger (-1..1) to a 0–100 RPM speed limit
+        speed_rpm = int((self.speed + 1) / 2 * self.max_rpm)
+
+        # Radial deadzone around the origin -> stop
+        if math.hypot(x, y) < self.deadzone:
+            left = 0
+            right = 0
+        # Sectors are split by the lines at +45° and -45° (|y| == |x|).
+        # Each sector snaps to the value at its centre.
+        # Direction snaps to the sector, but the magnitude scales with how
+        # far the stick is pushed along that sector's axis (0..1).
+        elif abs(y) >= abs(x):
+            rpm = int(speed_rpm * abs(y))
+            if y > 0:      # front sector: straight forward
+                left, right = rpm, rpm
+            else:          # back sector: straight reverse
+                left, right = -rpm, -rpm
+        else:
+            rpm = int(speed_rpm * abs(x))
+            if x > 0:      # point turn (right wheel faster)
+                left, right = -rpm, rpm
+            else:          # point turn the other way
+                left, right = rpm, -rpm
+
+        wheel_rpms = [
+            right, left,
+            right, left,
+            right, left
+        ]
+
+        self.values.data = wheel_rpms
+        self.publisher.publish(self.values)
+
+        self.get_logger().info(f"Wheel RPMs: {wheel_rpms}")
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = Drive()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

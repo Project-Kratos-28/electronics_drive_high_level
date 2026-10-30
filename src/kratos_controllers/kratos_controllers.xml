@@ -1,9 +1,0 @@
-<library path="kratos_controllers">
-  <class name="kratos_controllers/DoubleAckermannController"
-         type="kratos_controllers::DoubleAckermannController"
-         base_class_type="controller_interface::ControllerInterface">
-    <description>
-      Custom Double Ackermann steering controller for 4-wheel independent rovers.
-    </description>
-  </class>
-</library>
