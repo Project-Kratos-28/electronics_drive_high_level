@@ -23,6 +23,7 @@ class JoyMapperNode(Node):
         self.AXIS_YAW = 2        # Left stick vertical    -> angular.z (point turn)
         self.AXIS_CRAB_ANGLE = 5 # Crab walk wheel angle      -> angular.x
         self.BUTTON_MODE = 1     # 'B' button
+        self.BUTTON_CRAB_CENTER = 3  # 'A' button: wheels back to straight ahead (crab walk)
 
         self.max_lin_vel = 1.0
         self.max_ang_vel = 1.0
@@ -71,6 +72,9 @@ class JoyMapperNode(Node):
             cmd.angular.z = msg.axes[self.AXIS_YAW] * self.max_ang_vel
         if len(msg.axes) > self.AXIS_CRAB_ANGLE:
             cmd.angular.x = msg.axes[self.AXIS_CRAB_ANGLE]  # raw -1..1, scaled in drive_controller
+        # Re-center button -> angular.y flag (1.0 while held), read by drive_controller
+        if len(msg.buttons) > self.BUTTON_CRAB_CENTER and msg.buttons[self.BUTTON_CRAB_CENTER]:
+            cmd.angular.y = 1.0
         self.pub_cmd_vel.publish(cmd)
 
 
