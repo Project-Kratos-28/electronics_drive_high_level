@@ -10,6 +10,12 @@
 /drive_mode  std_msgs/String (latched): current drive mode name
 /crab_aim    std_msgs/Float64: crab wheel angle (rad, + = right). Lets the wheels pre-aim /
              re-center while stopped without putting a fake vector on /cmd_vel.
+/auto_mode   std_msgs/Bool (input): False = manual (this node drives), True = autonomous
+             (this node stays silent so Nav2 owns /cmd_vel). Boots in manual.
+             The flag also acts as the source selector for /cmd_vel: auto -> only Nav2's
+             /cmd_vel_nav is forwarded to /cmd_vel; manual -> only the joystick is.
+             The flag stays as last sent. Optional heartbeat: set AUTO_TIMEOUT > 0 and True
+             must then keep arriving (e.g. 2 Hz) or this node falls back to manual.
 
 Crab walk: the wheel angle is kept here (axis 5 swings it, button 3 re-centers it) and is
 published as the direction of the velocity vector: vx = v*cos(a), vy = -v*sin(a), where
@@ -22,7 +28,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import Joy
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Float64, Float64MultiArray, String
+from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 
 
 class JoyMapperNode(Node):
@@ -85,6 +91,21 @@ class JoyMapperNode(Node):
             reliability=ReliabilityPolicy.RELIABLE,
         )
 
+        # --- Auto / manual flag ---
+        # False = manual (joystick drives), True = autonomous (this node publishes nothing).
+        self.auto = False
+        self.AUTO_TOPIC = '/auto_mode'
+        self.AUTO_DRIVE_MODE = 'DOUBLE_ACKERMANN'   # mode forced while Nav2 drives
+        self.AUTO_TIMEOUT = 0.0     # s without a True before falling back to manual (0 = off: flag stays until changed)
+        self.last_auto_true = None
+        self.sub_auto = self.create_subscription(
+            Bool, self.AUTO_TOPIC, self.auto_callback, 10)
+        # Nav2 publishes here (remap its cmd_vel output to this). Forwarded to /cmd_vel
+        # only while auto is True; ignored otherwise.
+        self.NAV_TOPIC = '/cmd_vel_nav'
+        self.sub_nav = self.create_subscription(
+            Twist, self.NAV_TOPIC, self.nav_callback, 10)
+
         self.sub_joy = self.create_subscription(Joy, '/joy', self.joy_callback, 10)
         self.sub_feedback = self.create_subscription(
             Float64MultiArray, self.STEER_FEEDBACK_TOPIC, self.feedback_callback, 10)
@@ -102,6 +123,28 @@ class JoyMapperNode(Node):
         mode_msg.data = self.modes[self.mode_idx]
         self.pub_mode.publish(mode_msg)
         self.get_logger().info(f"Drive Mode Set To: {mode_msg.data}")
+
+    # ------------------------------------------------------------------
+    def auto_callback(self, msg: Bool):
+        """/auto_mode: True -> go silent for Nav2, False -> joystick drives again."""
+        if msg.data:
+            self.last_auto_true = self.get_clock().now()   # heartbeat
+        self.set_auto(msg.data)
+
+    def nav_callback(self, msg: Twist):
+        """Nav2 command -> /cmd_vel, but only while auto is True."""
+        if self.auto:
+            self.pub_cmd_vel.publish(msg)
+
+    def set_auto(self, on: bool):
+        if on == self.auto:
+            return
+        self.auto = on
+        self.pub_cmd_vel.publish(Twist())     # one clean stop on every handover
+        self.was_active = False
+        if self.auto:
+            self.set_mode(self.AUTO_DRIVE_MODE)   # Nav2 only gives vx / wz
+        self.get_logger().info(f"AUTO {'ON (joystick silent)' if self.auto else 'OFF (manual)'}")
 
     # ------------------------------------------------------------------
     def apply_deadzone(self, val):
@@ -181,6 +224,17 @@ class JoyMapperNode(Node):
         return (now - self.last_mode_switch).nanoseconds * 1e-9 > self.debounce_sec
 
     def joy_callback(self, msg: Joy):
+        if self.auto:
+            # Ignore buttons in auto, but keep edge state in sync so a button held
+            # during the handover doesn't fire when manual resumes.
+            if len(msg.buttons) > self.BUTTON_MODE:
+                self.prev_button_b = msg.buttons[self.BUTTON_MODE]
+            if len(msg.buttons) > self.BUTTON_POINT_TURN:
+                self.prev_button_pt = msg.buttons[self.BUTTON_POINT_TURN]
+            self.last_joy = msg
+            self.last_joy_time = self.get_clock().now()
+            return
+
         # B (rising edge): next mode in the cycle. From POINT_TURN, back to the cycle start.
         if len(msg.buttons) > self.BUTTON_MODE:
             current_b = msg.buttons[self.BUTTON_MODE]
@@ -207,6 +261,13 @@ class JoyMapperNode(Node):
 
     def tick(self):
         """Periodic: latest joystick state -> standard /cmd_vel."""
+        if self.auto:
+            if self.AUTO_TIMEOUT > 0.0 and self.last_auto_true is not None:
+                age = (self.get_clock().now() - self.last_auto_true).nanoseconds * 1e-9
+                if age > self.AUTO_TIMEOUT:
+                    self.get_logger().warn("/auto_mode heartbeat lost -> back to manual")
+                    self.set_auto(False)
+            return   # autonomous: publish nothing, Nav2 owns /cmd_vel
         if self.last_joy is None:
             return
         age = (self.get_clock().now() - self.last_joy_time).nanoseconds * 1e-9
