@@ -11,10 +11,13 @@ Inputs
                 while there is no /cmd_vel vector; it can never drive the rover.
 
 Output
-  /drive_controller/commands  Float64MultiArray, 8 values, wheel order FL, FR, RL, RR:
+  /drive_controller/rover  Float64MultiArray, 8 values, wheel order FL, FR, RL, RR:
                   [0:4] steering  (servo deg 0..180, 90 = straight; rad from center if
                         publish_servo_deg is false)
                   [4:8] wheel velocity in rpm (always)
+
+Pure rotation: in DOUBLE_ACKERMANN, a command with ~no forward speed but a yaw rate (what
+Nav2 sends to turn in place) is executed as a point turn at that yaw rate.
 
 Units: /cmd_vel (m/s, rad/s) is converted to rpm once, at RPM_PER_MS. Wheel speeds, the
 speed limit and the output are all rpm.
@@ -48,8 +51,10 @@ class DriveController(Node):
         self.declare_parameter('max_steer_rad', 0.5)          # Ackermann limit (~28.6 deg)
         self.declare_parameter('crab_max_angle_deg', 90.0)    # crab end stops
         self.declare_parameter('cmd_timeout', 0.5)            # s without /cmd_vel -> stop
+        self.declare_parameter('turn_lin_eps', 0.01)          # m/s: below this = no forward speed
+        self.declare_parameter('turn_ang_eps', 0.05)          # rad/s: above this = turning
         self.declare_parameter('publish_servo_deg', True)     # True: servo deg (90 = center)
-        self.declare_parameter('command_topic', '/drive_controller/commands')
+        self.declare_parameter('command_topic', '/drive_controller/rover')
 
         p = self.get_parameter
         self.L = p('wheelbase').value
@@ -59,6 +64,8 @@ class DriveController(Node):
         self.max_steer_rad = p('max_steer_rad').value
         self.CRAB_MAX_ANGLE_DEG = p('crab_max_angle_deg').value
         self.cmd_timeout = p('cmd_timeout').value
+        self.TURN_LIN_EPS = p('turn_lin_eps').value
+        self.TURN_ANG_EPS = p('turn_ang_eps').value
         self.PUBLISH_SERVO_DEG = p('publish_servo_deg').value
         self.COMMAND_TOPIC = p('command_topic').value
 
@@ -139,7 +146,7 @@ class DriveController(Node):
         angle = self.CENTER_ANGLE_DEG + delta_deg
         return max(self.SERVO_MIN_DEG, min(self.SERVO_MAX_DEG, angle))
 
-    def publish_commands(self, v_wheels, steer_angles_deg):
+    def publish_commands(self, steer_angles_deg, v_wheels):
         """Publish ONE 8-element array: [steer FL,FR,RL,RR, vel FL,FR,RL,RR]."""
         if self.PUBLISH_SERVO_DEG:
             steer = [float(d) for d in steer_angles_deg]
@@ -154,9 +161,16 @@ class DriveController(Node):
         msg.data = steer + vel
         self.cmd_pub.publish(msg)
 
+    def point_turn(self, wz):
+        """Spin in place at yaw rate wz -> (steering deltas in deg, wheel rpm)."""
+        alpha_deg = math.degrees(math.atan2(self.L, self.W))
+        radius = math.hypot(self.L / 2.0, self.W / 2.0)
+        rpm = wz * radius * self.RPM_PER_MS
+        return [alpha_deg, -alpha_deg, -alpha_deg, alpha_deg], [-rpm, rpm, -rpm, rpm]
+
     def stop(self):
         """Zero speed, wheels straight."""
-        self.publish_commands([0.0] * 4, [self.CENTER_ANGLE_DEG] * 4)
+        self.publish_commands([self.CENTER_ANGLE_DEG] * 4, [0.0] * 4)
 
     # ------------------------------------------------------------------
     def crab_from_twist(self, vx, vy):
@@ -203,42 +217,46 @@ class DriveController(Node):
 
             # --- 1. DOUBLE ACKERMANN ---
             if mode == 'DOUBLE_ACKERMANN':
-                if abs(vx) < self.MIN_CMD:
+                if abs(vx) < self.TURN_LIN_EPS and abs(wz) > self.TURN_ANG_EPS:
+                    # Pure rotation (e.g. Nav2 turning in place): do a point turn.
+                    delta_angles_deg, v_wheels = self.point_turn(wz)
+                elif abs(vx) < self.MIN_CMD:
                     self.stop()
                     return
-
-                # Path curvature (+ = left) -> wheel angle (+ = right)
-                curvature = wz / vx
-                steer_input_rad = math.atan(-curvature * self.L / 2.0)
-                steer_input_rad = max(-self.max_steer_rad,
-                                      min(self.max_steer_rad, steer_input_rad))
-                speed_input = vx * self.RPM_PER_MS      # rpm
-
-                if abs(steer_input_rad) < 1e-3:
-                    v_wheels = [speed_input] * 4
                 else:
-                    delta = abs(steer_input_rad)
-                    R = (self.L / 2.0) / math.tan(delta)
+                    # Path curvature (+ = left) -> wheel angle (+ = right)
+                    curvature = wz / vx
+                    steer_input_rad = math.atan(-curvature * self.L / 2.0)
+                    steer_input_rad = max(-self.max_steer_rad,
+                                          min(self.max_steer_rad, steer_input_rad))
+                    speed_input = vx * self.RPM_PER_MS      # rpm
 
-                    delta_in = math.atan2(self.L / 2.0, R - (self.W / 2.0))
-                    delta_out = math.atan2(self.L / 2.0, R + (self.W / 2.0))
+                    if abs(steer_input_rad) < 1e-3:
+                        v_wheels = [speed_input] * 4
+                    else:
+                        delta = abs(steer_input_rad)
+                        R = (self.L / 2.0) / math.tan(delta)
 
-                    R_c = math.hypot(R, self.L / 2.0)
-                    R_in = math.hypot(R - (self.W / 2.0), self.L / 2.0)
-                    R_out = math.hypot(R + (self.W / 2.0), self.L / 2.0)
+                        delta_in = math.atan2(self.L / 2.0, R - (self.W / 2.0))
+                        delta_out = math.atan2(self.L / 2.0, R + (self.W / 2.0))
 
-                    v_in = speed_input * (R_in / R_c)
-                    v_out = speed_input * (R_out / R_c)
+                        R_in = math.hypot(R - (self.W / 2.0), self.L / 2.0)
+                        R_out = math.hypot(R + (self.W / 2.0), self.L / 2.0)
 
-                    d_in_deg = math.degrees(delta_in)
-                    d_out_deg = math.degrees(delta_out)
+                        # vx is the speed of the rover center (distance R from the ICR),
+                        # so each wheel runs at vx * (its distance to ICR) / R.
+                        v_in = speed_input * (R_in / R)
+                        v_out = speed_input * (R_out / R)
 
-                    if steer_input_rad > 0:  # Turning Right
-                        delta_angles_deg = [d_out_deg, d_in_deg, -d_out_deg, -d_in_deg]
-                        v_wheels = [v_out, v_in, v_out, v_in]
-                    else:  # Turning Left
-                        delta_angles_deg = [-d_in_deg, -d_out_deg, d_in_deg, d_out_deg]
-                        v_wheels = [v_in, v_out, v_in, v_out]
+                        d_in_deg = math.degrees(delta_in)
+                        d_out_deg = math.degrees(delta_out)
+
+                        if steer_input_rad > 0:  # Turning Right
+                            delta_angles_deg = [d_out_deg, d_in_deg, -d_out_deg, -d_in_deg]
+                            v_wheels = [v_out, v_in, v_out, v_in]
+                        else:  # Turning Left
+                            delta_angles_deg = [-d_in_deg, -d_out_deg, d_in_deg, d_out_deg]
+                            v_wheels = [v_in, v_out, v_in, v_out]
 
             # --- 2. DIFFERENTIAL (skid steer: wheels straight, left/right speeds differ) ---
             elif mode == 'DIFFERENTIAL':
@@ -257,12 +275,7 @@ class DriveController(Node):
                     self.stop()
                     return
 
-                alpha_deg = math.degrees(math.atan2(self.L, self.W))
-                radius = math.hypot(self.L / 2.0, self.W / 2.0)
-
-                delta_angles_deg = [alpha_deg, -alpha_deg, -alpha_deg, alpha_deg]
-                rpm = wz * radius * self.RPM_PER_MS
-                v_wheels = [-rpm, rpm, -rpm, rpm]
+                delta_angles_deg, v_wheels = self.point_turn(wz)
 
             # --- 4. CRAB WALK (wheels point along the (vx, vy) velocity vector) ---
             elif mode == 'CRAB_WALK':
@@ -279,7 +292,7 @@ class DriveController(Node):
                 scale_factor = self.MAX_WHEEL_RPM / max_rpm
                 v_wheels = [v * scale_factor for v in v_wheels]
 
-            self.publish_commands(v_wheels, steer_angles_deg)
+            self.publish_commands(steer_angles_deg, v_wheels)
 
         except Exception as e:
             self.get_logger().error(f"Control loop error: {e}")

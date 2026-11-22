@@ -13,7 +13,9 @@ drive_controller:
   ros__parameters:
     publish_servo_deg: true      # steering in degrees, 0..180, 90 = straight ahead
     cmd_timeout: 0.5
-    command_topic: /drive_controller/commands
+    turn_lin_eps: 0.01           # m/s: below this = no forward speed
+    turn_ang_eps: 0.05           # rad/s: above this + no forward speed = point turn
+    command_topic: /drive_controller/rover
 
 # joy_mapper_node only
 joy_mapper_node:
