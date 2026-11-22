@@ -1,0 +1,22 @@
+# Shared by drive_controller and joy_mapper_node (wildcard node name).
+/**:
+  ros__parameters:
+    wheelbase: 1.032
+    track_width: 0.79
+    wheel_radius: 0.30
+    max_wheel_rpm: 100.0         # hardware max; lower temporarily for bench tests
+    max_steer_rad: 0.5
+    crab_max_angle_deg: 90.0
+
+# drive_controller only
+drive_controller:
+  ros__parameters:
+    publish_servo_deg: true      # steering in degrees, 0..180, 90 = straight ahead
+    cmd_timeout: 0.5
+    command_topic: /drive_controller/commands
+
+# joy_mapper_node only
+joy_mapper_node:
+  ros__parameters:
+    auto_timeout: 0.0            # >0: /auto_mode True must repeat within this many seconds
+    button_manual_override: -1   # gamepad button that kicks auto back to manual (-1 = off)

@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
-"""Swerve drive controller.
+"""Swerve drive controller (real rover).
 
 Inputs
-  /cmd_vel      geometry_msgs/Twist, STANDARD units (all modes):
+  /cmd_vel      geometry_msgs/Twist, standard units (manual and Nav2 both arrive here,
+                selected by joy_mapper_node):
                   linear.x  forward speed (m/s)    linear.y  left speed (m/s, crab walk)
                   angular.z yaw rate (rad/s, + = counter-clockwise)
   /drive_mode   std_msgs/String (latched): DOUBLE_ACKERMANN / DIFFERENTIAL / POINT_TURN / CRAB_WALK
-  /crab_aim     std_msgs/Float64 (optional): crab wheel angle (rad, + = right). Only turns the
-                wheels while there is no /cmd_vel vector; it can never drive the rover.
-  /steering_controller/feedback   measured wheel angles (optional, used in crab walk)
+  /crab_aim     std_msgs/Float64: crab wheel angle (rad, + = right). Only turns the wheels
+                while there is no /cmd_vel vector; it can never drive the rover.
 
 Output
-  /drive_controller/commands  [steer FL,FR,RL,RR, vel FL,FR,RL,RR]
+  /drive_controller/commands  Float64MultiArray, 8 values, wheel order FL, FR, RL, RR:
+                  [0:4] steering  (servo deg 0..180, 90 = straight; rad from center if
+                        publish_servo_deg is false)
+                  [4:8] wheel velocity in rpm (always)
+
+Units: /cmd_vel (m/s, rad/s) is converted to rpm once, at RPM_PER_MS. Wheel speeds, the
+speed limit and the output are all rpm.
+
+Parameters (see config/rover_params.yaml; shared with joy_mapper_node)
 """
 
 import math
@@ -32,68 +40,56 @@ class DriveController(Node):
     def __init__(self):
         super().__init__('drive_controller')
 
-        # --- Physical Dimensions (Meters) ---
-        self.L = 1.032  # Wheelbase
-        self.W = 0.79  # Track width
-        self.wheel_radius = 0.30      # Wheel radius (m)
+        # --- Parameters ---
+        self.declare_parameter('wheelbase', 1.032)            # m
+        self.declare_parameter('track_width', 0.79)           # m
+        self.declare_parameter('wheel_radius', 0.30)          # m
+        self.declare_parameter('max_wheel_rpm', 100.0)        # rpm limit on every wheel
+        self.declare_parameter('max_steer_rad', 0.5)          # Ackermann limit (~28.6 deg)
+        self.declare_parameter('crab_max_angle_deg', 90.0)    # crab end stops
+        self.declare_parameter('cmd_timeout', 0.5)            # s without /cmd_vel -> stop
+        self.declare_parameter('publish_servo_deg', True)     # True: servo deg (90 = center)
+        self.declare_parameter('command_topic', '/drive_controller/commands')
 
-        # --- Control & Hardware Limits ---
-        self.max_steer_rad = 0.5      # Ackermann limit (~28.6 deg)
-        self.cmd_timeout = 0.5        # Seconds without input before stopping
+        p = self.get_parameter
+        self.L = p('wheelbase').value
+        self.W = p('track_width').value
+        self.wheel_radius = p('wheel_radius').value
+        self.MAX_WHEEL_RPM = p('max_wheel_rpm').value
+        self.max_steer_rad = p('max_steer_rad').value
+        self.CRAB_MAX_ANGLE_DEG = p('crab_max_angle_deg').value
+        self.cmd_timeout = p('cmd_timeout').value
+        self.PUBLISH_SERVO_DEG = p('publish_servo_deg').value
+        self.COMMAND_TOPIC = p('command_topic').value
+
+        # --- Derived limits ---
         self.control_dt = 0.02        # Control loop period (s)
         self.MIN_CMD = 1e-3           # Below this (m/s or rad/s) a command counts as zero
+        # The one m/s -> rpm conversion: wheel rpm per 1 m/s at the rim.
+        self.RPM_PER_MS = 60.0 / (2.0 * math.pi * self.wheel_radius)
 
-        # Max wheel speed is defined in RPM; everything else is derived from it.
-        #   100 rpm -> 100 * 2*pi / 60 = 10.472 rad/s -> * 0.30 m = 3.1416 m/s
-        self.MAX_WHEEL_RPM = 100.0
-        self.max_wheel_omega = self.MAX_WHEEL_RPM * 2.0 * math.pi / 60.0   # rad/s
-        self.max_speed = self.max_wheel_omega * self.wheel_radius          # m/s (rim speed)
-
-        # Angle convention (full-circle wheels): servo frame 0..360, straight ahead = 180.
-        # Every mode computes a deflection from straight-ahead (-180..+180).
-        self.STEER_RANGE_DEG = 180.0
+        # Angle convention: servo frame 0..180, straight ahead = 90 (+/-90 deg of travel).
+        self.STEER_RANGE_DEG = 90.0
         self.CENTER_ANGLE_DEG = self.STEER_RANGE_DEG
         self.SERVO_MIN_DEG = 0.0
         self.SERVO_MAX_DEG = 2.0 * self.STEER_RANGE_DEG
 
-        # Crab walk: the wheel angle is the direction of the (vx, vy) vector. Below this
-        # speed (m/s) there is no direction information, so the last angle is held (or a
-        # fresh /crab_aim is followed, without driving).
+        # Crab walk: below this speed (m/s) the vector has no direction, so the last angle
+        # is held (or a fresh /crab_aim is followed, without driving).
         self.CRAB_DIR_MIN = 1e-4
-        # Joystick pre-aim: wheel angle (rad from center) published by joy_mapper_node.
         self.AIM_TOPIC = '/crab_aim'
-        self.AIM_TIMEOUT = 0.5        # Seconds before an aim command is considered stale
+        self.AIM_TIMEOUT = 0.5
         self.aim_angle_rad = None
         self.aim_time = None
-        # Rover steering feedback (Float64MultiArray, 4 wheels). Same units as the command:
-        # radians from center, or servo-frame degrees if PUBLISH_SERVO_DEG is True.
-        self.STEER_FEEDBACK_TOPIC = '/steering_controller/feedback'
-        self.FEEDBACK_TIMEOUT = 0.5   # Seconds before feedback is considered stale
-        # Crab walk end stops: wheel angle is capped at +/- this from straight ahead.
-        self.CRAB_MAX_ANGLE_DEG = 90.0
-        # False: publish steering as radians from center. True: servo-frame degrees.
-        self.PUBLISH_SERVO_DEG = False
-        # True : wheel velocities in rpm (command_splitter converts to rad/s for Gazebo).
-        # False: wheel velocities in rad/s.
-        self.PUBLISH_RPM = False
-
-        # --- Topics ---
-        # Combined command: One Float64MultiArray, 8 elements, wheel order FL, FR, RL, RR:
-        #   data[0:4] = steering angles   (rad from center, or servo deg if PUBLISH_SERVO_DEG)
-        #   data[4:8] = wheel velocities  (rad/s, or rpm if PUBLISH_RPM)
-        self.COMMAND_TOPIC = '/drive_controller/commands'
 
         # --- State ---
         self.modes = ['DOUBLE_ACKERMANN', 'DIFFERENTIAL', 'POINT_TURN', 'CRAB_WALK']
         self.current_mode = 'DOUBLE_ACKERMANN'
 
-        self.cmd_vx = 0.0           # m/s
-        self.cmd_vy = 0.0           # m/s (+ = left; used in crab walk)
-        self.cmd_wz = 0.0           # rad/s
-        self.last_steer_delta_deg = [0.0] * 4
+        self.cmd_vx = 0.0
+        self.cmd_vy = 0.0
+        self.cmd_wz = 0.0
         self.crab_angle_rad = 0.0   # commanded crab wheel angle (+ = right, held when stopped)
-        self.fb_angle_rad = None    # measured wheel angle (circular mean of 4 wheels)
-        self.fb_time = None
         self.last_cmd_time = self.get_clock().now()
 
         # --- ROS 2 interfaces ---
@@ -102,29 +98,16 @@ class DriveController(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             reliability=ReliabilityPolicy.RELIABLE,
         )
-
-        self.sub_cmd_vel = self.create_subscription(
-            Twist, '/cmd_vel', self.cmd_vel_callback, 10
-        )
-        self.sub_mode = self.create_subscription(
-            String, '/drive_mode', self.mode_callback, mode_qos
-        )
-        self.sub_feedback = self.create_subscription(
-            Float64MultiArray, self.STEER_FEEDBACK_TOPIC, self.feedback_callback, 10
-        )
-        self.sub_aim = self.create_subscription(
-            Float64, self.AIM_TOPIC, self.aim_callback, 10
-        )
-
-        # Single publisher: [steer x4, velocity x4]
-        self.cmd_pub = self.create_publisher(
-            Float64MultiArray, self.COMMAND_TOPIC, 10
-        )
+        self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
+        self.create_subscription(String, '/drive_mode', self.mode_callback, mode_qos)
+        self.create_subscription(Float64, self.AIM_TOPIC, self.aim_callback, 10)
+        self.cmd_pub = self.create_publisher(Float64MultiArray, self.COMMAND_TOPIC, 10)
 
         self.timer = self.create_timer(self.control_dt, self.control_loop)
         self.get_logger().info(
-            f"Drive Controller Active. Max wheel speed: {self.MAX_WHEEL_RPM:.0f} rpm "
-            f"= {self.max_wheel_omega:.3f} rad/s = {self.max_speed:.3f} m/s"
+            f"Drive Controller active. Max wheel speed {self.MAX_WHEEL_RPM:.0f} rpm | "
+            f"output: wheels in rpm, "
+            f"steering in {'servo deg' if self.PUBLISH_SERVO_DEG else 'rad'}"
         )
 
     # ------------------------------------------------------------------
@@ -140,19 +123,6 @@ class DriveController(Node):
             self.crab_angle_rad = 0.0
             self.get_logger().info(f"Switched Drive Mode -> {self.current_mode}")
 
-    def feedback_callback(self, msg: Float64MultiArray):
-        """Rover wheel angles -> one mean angle (rad from center, wrapped to [-pi, pi])."""
-        if not msg.data:
-            return
-        if self.PUBLISH_SERVO_DEG:
-            angles = [math.radians(d - self.CENTER_ANGLE_DEG) for d in msg.data]
-        else:
-            angles = list(msg.data)
-        s = sum(math.sin(a) for a in angles)
-        c = sum(math.cos(a) for a in angles)
-        self.fb_angle_rad = math.atan2(s, c)
-        self.fb_time = self.get_clock().now()
-
     def aim_callback(self, msg: Float64):
         self.aim_angle_rad = msg.data
         self.aim_time = self.get_clock().now()
@@ -165,49 +135,37 @@ class DriveController(Node):
         return self.aim_angle_rad if age <= self.AIM_TIMEOUT else None
 
     def map_angle_deg(self, delta_deg):
-        """Offset from center -> [0, 360] servo range."""
+        """Offset from center -> [0, 180] servo range."""
         angle = self.CENTER_ANGLE_DEG + delta_deg
         return max(self.SERVO_MIN_DEG, min(self.SERVO_MAX_DEG, angle))
 
     def publish_commands(self, v_wheels, steer_angles_deg):
         """Publish ONE 8-element array: [steer FL,FR,RL,RR, vel FL,FR,RL,RR]."""
-        self.last_steer_delta_deg = [deg - self.CENTER_ANGLE_DEG for deg in steer_angles_deg]
-
         if self.PUBLISH_SERVO_DEG:
             steer = [float(d) for d in steer_angles_deg]
         else:
-            steer = [math.radians(d) for d in self.last_steer_delta_deg]
+            steer = [math.radians(d - self.CENTER_ANGLE_DEG) for d in steer_angles_deg]
 
-        # m/s at the rim -> rad/s at the wheel (or rpm if PUBLISH_RPM)
-        unit = 60.0 / (2.0 * math.pi) if self.PUBLISH_RPM else 1.0
-        vel = [float(v / self.wheel_radius * unit) for v in v_wheels]
+        # v_wheels are rpm. Final hard limit on the published numbers.
+        lim = self.MAX_WHEEL_RPM
+        vel = [float(max(-lim, min(lim, v))) for v in v_wheels]
 
         msg = Float64MultiArray()
         msg.data = steer + vel
         self.cmd_pub.publish(msg)
 
     def stop(self):
+        """Zero speed, wheels straight."""
         self.publish_commands([0.0] * 4, [self.CENTER_ANGLE_DEG] * 4)
 
     # ------------------------------------------------------------------
-    def measured_angle(self):
-        """Latest wheel angle feedback (rad), or None if missing/stale."""
-        if self.fb_angle_rad is None or self.fb_time is None:
-            return None
-        age = (self.get_clock().now() - self.fb_time).nanoseconds * 1e-9
-        return self.fb_angle_rad if age <= self.FEEDBACK_TIMEOUT else None
-
     def crab_from_twist(self, vx, vy):
-        """Standard (vx, vy) -> crab wheel angle (self.crab_angle_rad) and signed wheel speed.
+        """(vx, vy) -> crab wheel angle (self.crab_angle_rad) and signed wheel speed.
 
-        The wheels point along the velocity vector (angle + = right, 0 = forward). The
-        same motion can be made with the wheels at a and speed +v, or at a-180 deg and
-        speed -v, so the one inside the +/-CRAB_MAX_ANGLE_DEG end stops (closest to the
-        current angle) is used. Reversing therefore keeps the wheels where they are and
-        just drives backwards.
-
-        Any non-zero vector is a real drive command, however slow. With no vector, the
-        wheels hold their angle, or follow a fresh /crab_aim (joystick pre-aim) without
+        Wheels point along the velocity vector (angle + = right, 0 = forward). The same
+        motion works at angle a with speed +v, or at a-180 deg with speed -v; the one
+        inside the +/-CRAB_MAX_ANGLE_DEG end stops (closest to the current angle) is used.
+        With no vector the wheels hold their angle, or follow a fresh /crab_aim without
         driving.
         """
         limit = math.radians(self.CRAB_MAX_ANGLE_DEG)
@@ -216,9 +174,9 @@ class DriveController(Node):
             aim = self.fresh_aim()
             if aim is not None:
                 self.crab_angle_rad = max(-limit, min(limit, aim))
-            return 0.0                      # never moves without a velocity command
+            return 0.0
 
-        h = math.atan2(-vy, vx)             # direction as a right-positive wheel angle
+        h = math.atan2(-vy, vx)
         alt = h - math.copysign(math.pi, h)
         cands = [(h, v), (alt, -v)]
         valid = [c for c in cands if abs(c[0]) <= limit + 1e-3]
@@ -237,8 +195,8 @@ class DriveController(Node):
                 self.cmd_vx = self.cmd_vy = self.cmd_wz = 0.0
 
             mode = self.current_mode
-            vx = self.cmd_vx      # m/s
-            wz = self.cmd_wz      # rad/s, + = counter-clockwise
+            vx = self.cmd_vx
+            wz = self.cmd_wz
 
             v_wheels = [0.0] * 4
             delta_angles_deg = [0.0] * 4
@@ -254,10 +212,9 @@ class DriveController(Node):
                 steer_input_rad = math.atan(-curvature * self.L / 2.0)
                 steer_input_rad = max(-self.max_steer_rad,
                                       min(self.max_steer_rad, steer_input_rad))
-                speed_input = vx
+                speed_input = vx * self.RPM_PER_MS      # rpm
 
                 if abs(steer_input_rad) < 1e-3:
-                    delta_angles_deg = [0.0, 0.0, 0.0, 0.0]
                     v_wheels = [speed_input] * 4
                 else:
                     delta = abs(steer_input_rad)
@@ -290,8 +247,8 @@ class DriveController(Node):
                     return
 
                 half_track = self.W / 2.0
-                v_left = vx - wz * half_track
-                v_right = vx + wz * half_track
+                v_left = (vx - wz * half_track) * self.RPM_PER_MS
+                v_right = (vx + wz * half_track) * self.RPM_PER_MS
                 v_wheels = [v_left, v_right, v_left, v_right]
 
             # --- 3. POINT TURN (spin in place at yaw rate wz) ---
@@ -304,34 +261,32 @@ class DriveController(Node):
                 radius = math.hypot(self.L / 2.0, self.W / 2.0)
 
                 delta_angles_deg = [alpha_deg, -alpha_deg, -alpha_deg, alpha_deg]
-                v_wheels = [-wz * radius, wz * radius, -wz * radius, wz * radius]
+                rpm = wz * radius * self.RPM_PER_MS
+                v_wheels = [-rpm, rpm, -rpm, rpm]
 
             # --- 4. CRAB WALK (wheels point along the (vx, vy) velocity vector) ---
             elif mode == 'CRAB_WALK':
                 speed = self.crab_from_twist(vx, self.cmd_vy)
 
-                # Drive only as far as the wheels have reached the target (no scrubbing
-                # while turning). Needs feedback; without it the target is assumed reached.
-                fb = self.measured_angle()
-                if fb is not None:
-                    remaining = wrap_pi(self.crab_angle_rad - fb)
-                    speed *= max(0.0, math.cos(remaining))
-
                 delta_angles_deg = [math.degrees(self.crab_angle_rad)] * 4
-                v_wheels = [speed] * 4
+                v_wheels = [speed * self.RPM_PER_MS] * 4
 
             steer_angles_deg = [self.map_angle_deg(d) for d in delta_angles_deg]
 
-            # Clamp so no wheel exceeds 100 rpm (keeps the ratio between wheels)
-            max_calculated_v = max(abs(v) for v in v_wheels)
-            if max_calculated_v > self.max_speed and max_calculated_v > 0:
-                scale_factor = self.max_speed / max_calculated_v
+            # Scale so no wheel exceeds max_wheel_rpm (keeps the ratio between wheels)
+            max_rpm = max(abs(v) for v in v_wheels)
+            if max_rpm > self.MAX_WHEEL_RPM:
+                scale_factor = self.MAX_WHEEL_RPM / max_rpm
                 v_wheels = [v * scale_factor for v in v_wheels]
 
             self.publish_commands(v_wheels, steer_angles_deg)
 
         except Exception as e:
             self.get_logger().error(f"Control loop error: {e}")
+            try:
+                self.stop()
+            except Exception:
+                pass
 
 
 def main(args=None):
@@ -342,8 +297,13 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            node.stop()          # last command out is always zero speed
+        except Exception:
+            pass
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

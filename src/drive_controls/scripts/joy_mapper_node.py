@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-"""Joystick -> STANDARD /cmd_vel for every drive mode.
+"""Joystick / Nav2 source selector -> STANDARD /cmd_vel.
 
-/cmd_vel     geometry_msgs/Twist, real units:
-               linear.x   m/s, + = forward
-               linear.y   m/s, + = left
-               angular.z  rad/s, + = counter-clockwise
-             Published only while the joystick is actually commanding motion (plus one
-             final zero Twist on release), so it never fights Nav2 while idle.
-/drive_mode  std_msgs/String (latched): current drive mode name
-/crab_aim    std_msgs/Float64: crab wheel angle (rad, + = right). Lets the wheels pre-aim /
-             re-center while stopped without putting a fake vector on /cmd_vel.
-/auto_mode   std_msgs/Bool (input): False = manual (this node drives), True = autonomous
-             (this node stays silent so Nav2 owns /cmd_vel). Boots in manual.
-             The flag also acts as the source selector for /cmd_vel: auto -> only Nav2's
-             /cmd_vel_nav is forwarded to /cmd_vel; manual -> only the joystick is.
-             The flag stays as last sent. Optional heartbeat: set AUTO_TIMEOUT > 0 and True
-             must then keep arriving (e.g. 2 Hz) or this node falls back to manual.
+Manual vs autonomous
+  /auto_mode     std_msgs/Bool (input). False = manual (default at boot), True = autonomous.
+  /cmd_vel       geometry_msgs/Twist, the only topic drive_controller listens to:
+                   manual -> this node publishes it from the joystick
+                   auto   -> this node stays silent; Nav2 publishes /cmd_vel directly
+                 One zero Twist is sent on every handover. While auto, the drive mode is
+                 forced to AUTO_DRIVE_MODE (Nav2 only gives vx and wz). In manual, make sure
+                 Nav2 has no active goal (cancel it), or both will publish on /cmd_vel.
+  Gamepad override: if the 'manual override' button is set (param), pressing it during
+  auto switches back to manual immediately and ignores /auto_mode True until a False
+  has been received.
+  Optional heartbeat: auto_timeout > 0 -> True must keep arriving or this node falls back
+  to manual.
 
-Crab walk: the wheel angle is kept here (axis 5 swings it, button 3 re-centers it) and is
-published as the direction of the velocity vector: vx = v*cos(a), vy = -v*sin(a), where
-a is the wheel angle (+ = right).
+Other outputs
+  /drive_mode  std_msgs/String (latched): current drive mode name
+  /crab_aim    std_msgs/Float64: crab wheel angle (rad, + = right), lets the wheels pre-aim
+               while stopped without a fake vector on /cmd_vel
+
+Crab walk: the wheel angle is kept here (axis swings it, button re-centers it) and is
+published as a velocity vector: vx = v*cos(a), vy = -v*sin(a), a = wheel angle (+ = right).
+
+Parameters: see config/rover_params.yaml (shared with drive_controller).
 """
 import math
 
@@ -28,113 +32,115 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import Joy
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Bool, Float64, Float64MultiArray, String
+from std_msgs.msg import Bool, Float64, String
 
 
 class JoyMapperNode(Node):
     def __init__(self):
         super().__init__('joy_mapper_node')
 
+        # --- Parameters (shared ones must match drive_controller: use one yaml) ---
+        self.declare_parameter('wheelbase', 1.032)
+        self.declare_parameter('track_width', 0.79)
+        self.declare_parameter('wheel_radius', 0.30)
+        self.declare_parameter('max_wheel_rpm', 100.0)
+        self.declare_parameter('max_steer_rad', 0.5)
+        self.declare_parameter('crab_max_angle_deg', 90.0)
+        # Joy-mapper only
+        self.declare_parameter('auto_timeout', 0.0)          # 0 = no heartbeat required
+        self.declare_parameter('button_manual_override', -1)  # gamepad button index, -1 = off
+
+        p = self.get_parameter
+        self.wheelbase = p('wheelbase').value
+        self.track_width = p('track_width').value
+        wheel_radius = p('wheel_radius').value
+        max_rpm = p('max_wheel_rpm').value
+        self.max_steer_rad = p('max_steer_rad').value
+        self.CRAB_MAX_ANGLE_DEG = p('crab_max_angle_deg').value
+        self.AUTO_TIMEOUT = p('auto_timeout').value
+        self.BUTTON_MANUAL_OVERRIDE = p('button_manual_override').value
+
+        # Joystick full trigger = max_wheel_rpm, converted ONCE to m/s because /cmd_vel is a Twist
+        self.max_speed = max_rpm * 2.0 * math.pi / 60.0 * wheel_radius
+        self.max_yaw_rate = self.max_speed   # rad/s at full stick (point turn)
+
+        # --- Modes ---
         self.modes = ['DOUBLE_ACKERMANN', 'DIFFERENTIAL', 'POINT_TURN', 'CRAB_WALK']
         self.mode_idx = 0
         self.prev_button_b = 0
         self.prev_button_pt = 0
-        # B cycles only these; POINT_TURN is reached with its own button and left with B.
+        self.prev_button_override = 0
+        # B cycles only these; POINT_TURN has its own button and is left with B.
         self.cycle_modes = ['DOUBLE_ACKERMANN', 'DIFFERENTIAL', 'CRAB_WALK']
 
-        # Pad layout (as observed): axes 0/1 = right stick, axis 2 = left stick vertical.
+        # Pad layout (as observed): axes 0/1 = right stick, axis 2 = speed trigger.
         self.AXIS_FORWARD = 1     # Right stick vertical   -> forward amount (up = +)
         self.AXIS_LATERAL = 0     # Right stick horizontal -> steering / turn (left = +)
         self.AXIS_YAW = 2         # Speed trigger (rest = -1); raw stick in POINT_TURN
         self.AXIS_CRAB_ANGLE = 5  # Crab walk wheel angle
-        self.BUTTON_MODE = 1          # 'B' button: cycle drive mode (not POINT_TURN)
-        self.BUTTON_POINT_TURN = 4    # jump straight to POINT_TURN; B returns to the cycle
+        self.BUTTON_MODE = 1          # cycle drive mode (not POINT_TURN)
+        self.BUTTON_POINT_TURN = 4    # jump to POINT_TURN; B returns to the cycle
         self.BUTTON_CRAB_CENTER = 3   # crab wheels back to straight ahead
 
-        # --- Scaling to real units ---
-        self.deadzone = 0.15
-        # m/s at full speed trigger: 100 rpm on 0.30 m wheels (keep in sync with drive_controller)
-        self.max_speed = 100.0 * 2.0 * math.pi / 60.0 * 0.30
-        self.max_yaw_rate = self.max_speed   # rad/s at full stick (point turn)
-        # Geometry (keep in sync with drive_controller)
-        self.wheelbase = 1.032        # m
-        self.track_width = 0.79       # m
-        self.max_steer_rad = 0.5      # rad, wheel angle at full stick (double Ackermann)
-
         # --- Signal conventions ---
+        self.deadzone = 0.15
         self.INVERT_POINT_TURN_W = -1.0
         self.INVERT_CRAB_ANGLE = -1.0
         self.CRAB_SPEED_IS_TRIGGER = True    # speed axis rest = -1 -> mapped to 0..1
         self.CRAB_ANGLE_IS_TRIGGER = False   # angle axis is a stick resting at 0
 
-        # --- Crab walk wheel angle (moved here from drive_controller) ---
-        self.control_dt = 0.02               # loop period (s)
+        # --- Timing / crab ---
+        self.control_dt = 0.02
         self.joy_timeout = 0.5               # stop publishing if /joy goes quiet
         self.CRAB_STEER_RATE_DEG_S = 60.0    # wheel swing speed at full axis deflection
-        self.CRAB_MAX_ANGLE_DEG = 90.0       # end stops, +/- from straight ahead
-        self.STEER_FEEDBACK_TOPIC = '/steering_controller/feedback'
-        self.FEEDBACK_TIMEOUT = 0.5
-        self.PUBLISH_SERVO_DEG = False       # feedback units (same flag as drive_controller)
-        self.CENTER_ANGLE_DEG = 180.0
         self.crab_angle_rad = 0.0            # commanded crab wheel angle (+ = right)
-        self.fb_angle_rad = None
-        self.fb_time = None
 
         self.last_joy = None
         self.last_joy_time = None
         self.last_mode_switch = self.get_clock().now()
         self.debounce_sec = 0.3
 
+        # --- Auto / manual ---
+        self.auto = False
+        self.auto_locked_out = False         # set by the gamepad override
+        self.AUTO_DRIVE_MODE = 'DOUBLE_ACKERMANN'
+        self.last_auto_true = None
+
         mode_qos = QoSProfile(
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             reliability=ReliabilityPolicy.RELIABLE,
         )
-
-        # --- Auto / manual flag ---
-        # False = manual (joystick drives), True = autonomous (this node publishes nothing).
-        self.auto = False
-        self.AUTO_TOPIC = '/auto_mode'
-        self.AUTO_DRIVE_MODE = 'DOUBLE_ACKERMANN'   # mode forced while Nav2 drives
-        self.AUTO_TIMEOUT = 0.0     # s without a True before falling back to manual (0 = off: flag stays until changed)
-        self.last_auto_true = None
-        self.sub_auto = self.create_subscription(
-            Bool, self.AUTO_TOPIC, self.auto_callback, 10)
-        # Nav2 publishes here (remap its cmd_vel output to this). Forwarded to /cmd_vel
-        # only while auto is True; ignored otherwise.
-        self.NAV_TOPIC = '/cmd_vel_nav'
-        self.sub_nav = self.create_subscription(
-            Twist, self.NAV_TOPIC, self.nav_callback, 10)
-
-        self.sub_joy = self.create_subscription(Joy, '/joy', self.joy_callback, 10)
-        self.sub_feedback = self.create_subscription(
-            Float64MultiArray, self.STEER_FEEDBACK_TOPIC, self.feedback_callback, 10)
+        self.create_subscription(Bool, '/auto_mode', self.auto_callback, 10)
+        self.create_subscription(Joy, '/joy', self.joy_callback, 10)
         self.pub_cmd_vel = self.create_publisher(Twist, '/cmd_vel', 10)
         self.pub_mode = self.create_publisher(String, '/drive_mode', mode_qos)
         self.pub_aim = self.create_publisher(Float64, '/crab_aim', 10)
         self.was_active = False
         self.timer = self.create_timer(self.control_dt, self.tick)
 
-        self.get_logger().info("Joy Mapper Active: /joy -> /cmd_vel (m/s, rad/s) & /drive_mode")
+        self.get_logger().info(
+            f"Joy Mapper active (manual). Full speed = {self.max_speed:.3f} m/s")
         self.publish_mode()
 
     def publish_mode(self):
-        mode_msg = String()
-        mode_msg.data = self.modes[self.mode_idx]
-        self.pub_mode.publish(mode_msg)
-        self.get_logger().info(f"Drive Mode Set To: {mode_msg.data}")
+        msg = String()
+        msg.data = self.modes[self.mode_idx]
+        self.pub_mode.publish(msg)
+        self.get_logger().info(f"Drive Mode Set To: {msg.data}")
 
     # ------------------------------------------------------------------
+    # Auto / manual switching
+    # ------------------------------------------------------------------
     def auto_callback(self, msg: Bool):
-        """/auto_mode: True -> go silent for Nav2, False -> joystick drives again."""
-        if msg.data:
+        """/auto_mode: True -> Nav2 drives, False -> joystick drives."""
+        if not msg.data:
+            self.auto_locked_out = False          # explicit False clears the lockout
+        elif self.auto_locked_out:
+            return                                # gamepad override is active
+        else:
             self.last_auto_true = self.get_clock().now()   # heartbeat
         self.set_auto(msg.data)
-
-    def nav_callback(self, msg: Twist):
-        """Nav2 command -> /cmd_vel, but only while auto is True."""
-        if self.auto:
-            self.pub_cmd_vel.publish(msg)
 
     def set_auto(self, on: bool):
         if on == self.auto:
@@ -143,9 +149,11 @@ class JoyMapperNode(Node):
         self.pub_cmd_vel.publish(Twist())     # one clean stop on every handover
         self.was_active = False
         if self.auto:
-            self.set_mode(self.AUTO_DRIVE_MODE)   # Nav2 only gives vx / wz
-        self.get_logger().info(f"AUTO {'ON (joystick silent)' if self.auto else 'OFF (manual)'}")
+            self.set_mode(self.AUTO_DRIVE_MODE)
+        self.get_logger().info(f"AUTO {'ON (Nav2 drives)' if self.auto else 'OFF (manual)'}")
 
+    # ------------------------------------------------------------------
+    # Joystick helpers
     # ------------------------------------------------------------------
     def apply_deadzone(self, val):
         if abs(val) < self.deadzone:
@@ -166,32 +174,12 @@ class JoyMapperNode(Node):
             norm = max(0.0, min(1.0, raw))
         return self.apply_deadzone(norm) * self.max_speed
 
-    def feedback_callback(self, msg: Float64MultiArray):
-        """Rover wheel angles -> one mean angle (rad from center, wrapped to [-pi, pi])."""
-        if not msg.data:
-            return
-        if self.PUBLISH_SERVO_DEG:
-            angles = [math.radians(d - self.CENTER_ANGLE_DEG) for d in msg.data]
-        else:
-            angles = list(msg.data)
-        s = sum(math.sin(a) for a in angles)
-        c = sum(math.cos(a) for a in angles)
-        self.fb_angle_rad = math.atan2(s, c)
-        self.fb_time = self.get_clock().now()
-
-    def measured_angle(self):
-        if self.fb_angle_rad is None or self.fb_time is None:
-            return None
-        age = (self.get_clock().now() - self.fb_time).nanoseconds * 1e-9
-        return self.fb_angle_rad if age <= self.FEEDBACK_TIMEOUT else None
-
     def crab_update_angle(self, msg, center):
-        """Axis 5 -> crab wheel angle (rad, 0 = forward, + = right).
+        """Crab axis -> wheel angle (rad, 0 = forward, + = right).
 
-        Each cycle the target moves from the *measured* angle by
-        deflection * rate * dt (falls back to the last command without feedback), so the
-        wheels swing gradually. A released axis holds the angle; the re-center button snaps
-        it back to straight ahead.
+        Each cycle the target moves from the last commanded angle by
+        deflection * rate * dt. A released axis holds the angle; the re-center button
+        snaps it back to straight ahead.
         """
         if center:
             self.crab_angle_rad = 0.0
@@ -206,13 +194,11 @@ class JoyMapperNode(Node):
         if deflection == 0.0:
             return
 
-        fb = self.measured_angle()
-        base = fb if fb is not None else self.crab_angle_rad
+        base = self.crab_angle_rad
         step = deflection * math.radians(self.CRAB_STEER_RATE_DEG_S) * self.control_dt
         limit = math.radians(self.CRAB_MAX_ANGLE_DEG)
         self.crab_angle_rad = max(-limit, min(limit, base + step))
 
-    # ------------------------------------------------------------------
     def set_mode(self, name):
         self.mode_idx = self.modes.index(name)
         self.crab_angle_rad = 0.0
@@ -223,56 +209,64 @@ class JoyMapperNode(Node):
         now = self.get_clock().now()
         return (now - self.last_mode_switch).nanoseconds * 1e-9 > self.debounce_sec
 
+    def button(self, msg, idx):
+        return msg.buttons[idx] if 0 <= idx < len(msg.buttons) else 0
+
+    # ------------------------------------------------------------------
     def joy_callback(self, msg: Joy):
+        # Gamepad override works in both modes (edge-triggered).
+        ov = self.button(msg, self.BUTTON_MANUAL_OVERRIDE)
+        if ov == 1 and self.prev_button_override == 0 and self.auto:
+            self.auto_locked_out = True
+            self.set_auto(False)
+            self.get_logger().warn("Manual override pressed -> auto OFF")
+        self.prev_button_override = ov
+
         if self.auto:
-            # Ignore buttons in auto, but keep edge state in sync so a button held
+            # Ignore mode buttons in auto, but keep edge state in sync so a button held
             # during the handover doesn't fire when manual resumes.
-            if len(msg.buttons) > self.BUTTON_MODE:
-                self.prev_button_b = msg.buttons[self.BUTTON_MODE]
-            if len(msg.buttons) > self.BUTTON_POINT_TURN:
-                self.prev_button_pt = msg.buttons[self.BUTTON_POINT_TURN]
+            self.prev_button_b = self.button(msg, self.BUTTON_MODE)
+            self.prev_button_pt = self.button(msg, self.BUTTON_POINT_TURN)
             self.last_joy = msg
             self.last_joy_time = self.get_clock().now()
             return
 
         # B (rising edge): next mode in the cycle. From POINT_TURN, back to the cycle start.
-        if len(msg.buttons) > self.BUTTON_MODE:
-            current_b = msg.buttons[self.BUTTON_MODE]
-            if current_b == 1 and self.prev_button_b == 0 and self.debounced():
-                current = self.modes[self.mode_idx]
-                if current in self.cycle_modes:
-                    i = self.cycle_modes.index(current)
-                    nxt = self.cycle_modes[(i + 1) % len(self.cycle_modes)]
-                else:
-                    nxt = self.cycle_modes[0]
-                self.set_mode(nxt)
-            self.prev_button_b = current_b
+        current_b = self.button(msg, self.BUTTON_MODE)
+        if current_b == 1 and self.prev_button_b == 0 and self.debounced():
+            current = self.modes[self.mode_idx]
+            if current in self.cycle_modes:
+                i = self.cycle_modes.index(current)
+                nxt = self.cycle_modes[(i + 1) % len(self.cycle_modes)]
+            else:
+                nxt = self.cycle_modes[0]
+            self.set_mode(nxt)
+        self.prev_button_b = current_b
 
-        # Button 4 (rising edge): jump to POINT_TURN
-        if len(msg.buttons) > self.BUTTON_POINT_TURN:
-            current_pt = msg.buttons[self.BUTTON_POINT_TURN]
-            if (current_pt == 1 and self.prev_button_pt == 0 and self.debounced()
-                    and self.modes[self.mode_idx] != 'POINT_TURN'):
-                self.set_mode('POINT_TURN')
-            self.prev_button_pt = current_pt
+        # Point-turn button (rising edge)
+        current_pt = self.button(msg, self.BUTTON_POINT_TURN)
+        if (current_pt == 1 and self.prev_button_pt == 0 and self.debounced()
+                and self.modes[self.mode_idx] != 'POINT_TURN'):
+            self.set_mode('POINT_TURN')
+        self.prev_button_pt = current_pt
 
         self.last_joy = msg
         self.last_joy_time = self.get_clock().now()
 
     def tick(self):
-        """Periodic: latest joystick state -> standard /cmd_vel."""
+        """Periodic: latest joystick state -> standard /cmd_vel (manual only)."""
         if self.auto:
             if self.AUTO_TIMEOUT > 0.0 and self.last_auto_true is not None:
                 age = (self.get_clock().now() - self.last_auto_true).nanoseconds * 1e-9
                 if age > self.AUTO_TIMEOUT:
                     self.get_logger().warn("/auto_mode heartbeat lost -> back to manual")
                     self.set_auto(False)
-            return   # autonomous: publish nothing, Nav2 owns /cmd_vel
+            return   # autonomous: Nav2 publishes /cmd_vel itself
         if self.last_joy is None:
             return
         age = (self.get_clock().now() - self.last_joy_time).nanoseconds * 1e-9
         if age > self.joy_timeout:
-            return   # /joy went quiet: stop publishing, drive_controller's watchdog stops the rover
+            return   # /joy quiet: drive_controller's watchdog stops the rover
 
         msg = self.last_joy
         mode = self.modes[self.mode_idx]
@@ -290,20 +284,18 @@ class JoyMapperNode(Node):
             cmd.angular.z = vx * curvature
 
         elif mode == 'DIFFERENTIAL':
-            # 4-sector logic, expressed as a standard Twist.
-            # Stick angle: 0 = straight forward, + = right, +-180 = straight back.
-            steer_x = -side                      # + = stick right
+            # 4-sector logic. Stick angle: 0 = forward, + = right, +-180 = back.
+            steer_x = -side
             if speed < 1e-4 or abs(fwd) + abs(steer_x) < 1e-4:
                 pass                             # stop: zero Twist
             else:
                 theta_deg = math.degrees(math.atan2(steer_x, fwd))
-                if abs(theta_deg) <= 45.0:       # FRONT sector: straight forward
+                if abs(theta_deg) <= 45.0:
                     cmd.linear.x = speed
-                elif abs(theta_deg) >= 135.0:    # BACK sector: straight backward
+                elif abs(theta_deg) >= 135.0:
                     cmd.linear.x = -speed
                 else:
-                    # Spin in place with wheel rim speed = speed:
-                    # wz = (v_right - v_left) / track.  Stick right = clockwise = negative.
+                    # Spin in place with wheel rim speed = speed (stick right = clockwise).
                     spin = speed / (self.track_width / 2.0)
                     cmd.angular.z = -spin if steer_x > 0 else spin
 
@@ -312,22 +304,18 @@ class JoyMapperNode(Node):
             cmd.angular.z = self.INVERT_POINT_TURN_W * raw_w * self.max_yaw_rate
 
         elif mode == 'CRAB_WALK':
-            center = (len(msg.buttons) > self.BUTTON_CRAB_CENTER
-                      and bool(msg.buttons[self.BUTTON_CRAB_CENTER]))
+            center = bool(self.button(msg, self.BUTTON_CRAB_CENTER))
             self.crab_update_angle(msg, center)
 
-            # Wheel angle goes on its own topic so /cmd_vel stays a plain Twist.
             aim = Float64()
             aim.data = self.crab_angle_rad
             self.pub_aim.publish(aim)
 
             s = fwd * speed                      # signed speed along the wheel direction
-            # Wheel angle a (+ = right)  ->  velocity direction in the standard frame
             cmd.linear.x = s * math.cos(self.crab_angle_rad)
             cmd.linear.y = -s * math.sin(self.crab_angle_rad)
 
-        # Only speak on /cmd_vel while actually commanding motion, plus one final zero on
-        # release. An idle joystick stays silent so it doesn't override Nav2.
+        # Speak on /cmd_vel only while commanding motion, plus one final zero on release.
         active = (abs(cmd.linear.x) > 1e-4 or abs(cmd.linear.y) > 1e-4
                   or abs(cmd.angular.z) > 1e-4)
         if active or self.was_active:
@@ -343,8 +331,13 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            node.pub_cmd_vel.publish(Twist())
+        except Exception:
+            pass
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
