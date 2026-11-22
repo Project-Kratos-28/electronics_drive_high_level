@@ -9,12 +9,14 @@ Inputs
   /drive_mode   std_msgs/String (latched): DOUBLE_ACKERMANN / DIFFERENTIAL / POINT_TURN / CRAB_WALK
   /crab_aim     std_msgs/Float64: crab wheel angle (rad, + = right). Only turns the wheels
                 while there is no /cmd_vel vector; it can never drive the rover.
+  /e_stop       std_msgs/Bool: true = e-stop (9th output element = 1), false = clear
 
 Output
-  /drive_controller/rover  Float64MultiArray, 8 values, wheel order FL, FR, RL, RR:
+  /drive_controller/rover  Float64MultiArray, 9 values, wheel order FL, FR, RL, RR:
                   [0:4] steering  (servo deg 0..180, 90 = straight; rad from center if
                         publish_servo_deg is false)
                   [4:8] wheel velocity in rpm (always)
+                  [8]   e-stop flag: 0 normally, 1 while /e_stop is 1
 
 Pure rotation: in DOUBLE_ACKERMANN, a command with ~no forward speed but a yaw rate (what
 Nav2 sends to turn in place) is executed as a point turn at that yaw rate.
@@ -30,7 +32,7 @@ import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
-from std_msgs.msg import Float64, Float64MultiArray, String
+from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from geometry_msgs.msg import Twist
 
 
@@ -85,6 +87,7 @@ class DriveController(Node):
         # is held (or a fresh /crab_aim is followed, without driving).
         self.CRAB_DIR_MIN = 1e-4
         self.AIM_TOPIC = '/crab_aim'
+        self.ESTOP_TOPIC = '/e_stop'      # std_msgs/Bool: true = e-stop
         self.AIM_TIMEOUT = 0.5
         self.aim_angle_rad = None
         self.aim_time = None
@@ -97,6 +100,7 @@ class DriveController(Node):
         self.cmd_vy = 0.0
         self.cmd_wz = 0.0
         self.crab_angle_rad = 0.0   # commanded crab wheel angle (+ = right, held when stopped)
+        self.estop = 0              # 9th output element; follows /e_stop
         self.last_cmd_time = self.get_clock().now()
 
         # --- ROS 2 interfaces ---
@@ -108,6 +112,7 @@ class DriveController(Node):
         self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
         self.create_subscription(String, '/drive_mode', self.mode_callback, mode_qos)
         self.create_subscription(Float64, self.AIM_TOPIC, self.aim_callback, 10)
+        self.create_subscription(Bool, self.ESTOP_TOPIC, self.estop_callback, 10)
         self.cmd_pub = self.create_publisher(Float64MultiArray, self.COMMAND_TOPIC, 10)
 
         self.timer = self.create_timer(self.control_dt, self.control_loop)
@@ -130,6 +135,13 @@ class DriveController(Node):
             self.crab_angle_rad = 0.0
             self.get_logger().info(f"Switched Drive Mode -> {self.current_mode}")
 
+    def estop_callback(self, msg: Bool):
+        """/e_stop: true -> 9th output element = 1, false -> back to 0."""
+        new = 1 if msg.data else 0
+        if new != self.estop:
+            self.estop = new
+            self.get_logger().warn(f"E-STOP {'ACTIVE' if new else 'released'}")
+
     def aim_callback(self, msg: Float64):
         self.aim_angle_rad = msg.data
         self.aim_time = self.get_clock().now()
@@ -147,7 +159,7 @@ class DriveController(Node):
         return max(self.SERVO_MIN_DEG, min(self.SERVO_MAX_DEG, angle))
 
     def publish_commands(self, steer_angles_deg, v_wheels):
-        """Publish ONE 8-element array: [steer FL,FR,RL,RR, vel FL,FR,RL,RR]."""
+        """Publish ONE 9-element array: [steer FL,FR,RL,RR, vel FL,FR,RL,RR, estop]."""
         if self.PUBLISH_SERVO_DEG:
             steer = [float(d) for d in steer_angles_deg]
         else:
@@ -158,7 +170,8 @@ class DriveController(Node):
         vel = [float(max(-lim, min(lim, v))) for v in v_wheels]
 
         msg = Float64MultiArray()
-        msg.data = steer + vel
+        # 9th element: e-stop flag (0 normally, 1 while /e_stop says 1)
+        msg.data = steer + vel + [float(self.estop)]
         self.cmd_pub.publish(msg)
 
     def point_turn(self, wz):
