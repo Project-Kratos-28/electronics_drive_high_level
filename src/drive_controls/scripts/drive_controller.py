@@ -44,9 +44,9 @@ class DriveController(Node):
         super().__init__('drive_controller')
 
         # --- Parameters ---
-        self.declare_parameter('wheelbase', 1.032)            # m
-        self.declare_parameter('track_width', 0.79)           # m
-        self.declare_parameter('wheel_radius', 0.30)          # m
+        self.declare_parameter('wheelbase', 0.64)            # m
+        self.declare_parameter('track_width', 0.1)           # m
+        self.declare_parameter('wheel_radius', 0.15)          # m
         self.declare_parameter('max_wheel_rpm', 100.0)        # rpm limit on every wheel
         self.declare_parameter('max_steer_rad', 0.5)          # Ackermann limit (~28.6 deg)
         self.declare_parameter('crab_max_angle_deg', 90.0)    # crab end stops
